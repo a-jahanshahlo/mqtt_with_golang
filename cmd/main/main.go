@@ -65,7 +65,7 @@ func main() {
 		if err := json.Unmarshal([]byte(msg.Payload), &warning); err != nil {
 			panic(err)
 		}
-		fmt.Println("######Received message from " + msg.Channel + " channel.#####")
+		fmt.Println("**********Received message from " + msg.Channel + " *************")
 		fmt.Printf("%+v\n", warning)
 	}
 }
@@ -88,8 +88,8 @@ func publishToRedis(log TempLog) {
 }
 
 var f mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Message) {
-	fmt.Printf("TOPIC: %s\n", msg.Topic())
-	fmt.Printf("MSG: %s\n", msg.Payload())
+	//fmt.Printf("TOPIC: %s\n", msg.Topic())
+	//fmt.Printf("MSG: %s\n", msg.Payload())
 
 	var log = TempLog{}
 	if err := json.Unmarshal([]byte(msg.Payload()), &log); err != nil {
