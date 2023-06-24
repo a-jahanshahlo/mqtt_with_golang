@@ -186,6 +186,9 @@ func (c *Client) read() {
 		//If there is no error message, put the information in Broadcast
 		jsonMessage, _ := json.Marshal(&Message{Sender: c.id, Content: string(message), ServerIP: LocalIp(), SenderIP: c.socket.RemoteAddr().String()})
 		manager.broadcast <- jsonMessage
+
+		fmt.Println("**********Received message from   *************")
+		fmt.Println(jsonMessage)
 	}
 }
 
@@ -202,7 +205,9 @@ func (c *Client) write() {
 			if !ok {
 				_ = c.socket.WriteMessage(websocket.CloseMessage, []byte{})
 				return
+
 			}
+
 			//Write it if there is news and send it to the web side
 			_ = c.socket.WriteMessage(websocket.TextMessage, message)
 		}
