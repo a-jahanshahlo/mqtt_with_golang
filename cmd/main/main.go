@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis"
 	"github.com/gorilla/websocket"
+	uuid "github.com/satori/go.uuid"
 )
 
 type HasWarnings struct {
@@ -35,52 +37,20 @@ type TempLog struct {
 	Signal         int       `json:"signal"`
 	PowerSupply    int       `json:"powerSupply"`
 }
-type connection struct {
-	ws   *websocket.Conn
-	send chan []byte
-}
-type hub struct {
-	rooms      map[string]map[*connection]bool
-	broadcast  chan message
-	register   chan subscription
-	unregister chan subscription
-}
-type subscription struct {
-	conn *connection
-}
-type message struct {
-	data []byte
-	room string
-}
-
-const (
-	// Time allowed to write a message to the peer.
-	writeWait = 10 * time.Second
-
-	// Time allowed to read the next pong message from the peer.
-	pongWait = 60 * time.Second
-
-	// Send pings to peer with this period. Must be less than pongWait.
-	pingPeriod = (pongWait * 9) / 10
-
-	// Maximum message size allowed from peer.
-	maxMessageSize = 512
-)
-
-var h = hub{
-	broadcast: make(chan message),
-	rooms:     make(map[string]map[*connection]bool),
-}
 
 func main() {
+
+	fmt.Println("Starting application...")
+	//Open a goroutine execution start program
+	//go manager.start()
+
 	app := router.Config{}
 	router := gin.New()
-	go h.run()
 
 	listenToMqtt()
 	router.Use(app.Routes())
 	router.GET("/ping", pong)
-	router.GET("/monitoring", pong)
+	router.GET("/monitoring", wsHandler)
 	s := &http.Server{
 		Addr:           ":8087",
 		Handler:        router,
@@ -103,125 +73,191 @@ func main() {
 		if err := json.Unmarshal([]byte(msg.Payload), &warning); err != nil {
 			panic(err)
 		}
+		jsonMessage, _ := json.Marshal(&Message{Sender: "ali-server", Content: string(msg.Payload), ServerIP: "sss", SenderIP: ""})
+		manager.broadcast <- jsonMessage
+
 		fmt.Println("**********Received message from " + msg.Channel + " *************")
 		fmt.Printf("%+v\n", warning)
 	}
 }
 
 // websocket
-func echo(w http.ResponseWriter, r *http.Request) {
-	c, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Print("upgrade:", err)
-		return
-	}
-	defer c.Close()
-	for {
-		mt, message, err := c.ReadMessage()
-		if err != nil {
-			log.Println("read:", err)
-			break
-		}
-		log.Printf("recv: %s", message)
-		err = c.WriteMessage(mt, message)
-		if err != nil {
-			log.Println("write:", err)
-			break
-		}
-	}
+// Client management
+type ClientManager struct {
+	//The client map stores and manages all long connection clients, online is TRUE, and those who are not there are FALSE
+	clients map[*Client]bool
+	//Web side MESSAGE we use Broadcast to receive, and finally distribute it to all clients
+	broadcast chan []byte
+	//Newly created long connection client
+	register chan *Client
+	//Newly canceled long connection client
+	unregister chan *Client
 }
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
+// Client
+type Client struct {
+	//User ID
+	id string
+	//Connected socket
+	socket *websocket.Conn
+	//Message
+	send chan []byte
 }
 
-func serveWs(w http.ResponseWriter, r *http.Request) {
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println(err.Error())
-		return
-	}
-	c := &connection{send: make(chan []byte, 256), ws: ws}
-	s := subscription{c}
-	h.register <- s
-	go s.writePump()
-	go s.readPump()
+// Will formatting Message into JSON
+type Message struct {
+	//Message Struct
+	Sender    string `json:"sender,omitempty"`    //发送者
+	Recipient string `json:"recipient,omitempty"` //接收者
+	Content   string `json:"content,omitempty"`   //内容
+	ServerIP  string `json:"serverIp,omitempty"`  //实际不需要 验证k8s
+	SenderIP  string `json:"senderIp,omitempty"`  //实际不需要 验证k8s
 }
 
-func (s subscription) readPump() {
-	c := s.conn
-	defer func() {
-		h.unregister <- s
-		c.ws.Close()
-	}()
-	c.ws.SetReadLimit(maxMessageSize)
-	c.ws.SetReadDeadline(time.Now().Add(pongWait))
-	c.ws.SetPongHandler(func(string) error { c.ws.SetReadDeadline(time.Now().Add(pongWait)); return nil })
-	for {
-		_, msg, err := c.ws.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway) {
-				log.Printf("error: %v", err)
-			}
-			break
-		}
-		m := message{msg, "1"}
-		h.broadcast <- m
-	}
+// Create a client manager
+var manager = ClientManager{
+	broadcast:  make(chan []byte),
+	register:   make(chan *Client),
+	unregister: make(chan *Client),
+	clients:    make(map[*Client]bool),
 }
-func (s *subscription) writePump() {
-	c := s.conn
-	ticker := time.NewTicker(pingPeriod)
-	defer func() {
-		ticker.Stop()
-		c.ws.Close()
-	}()
+
+func (manager *ClientManager) start() {
 	for {
 		select {
-		case message, ok := <-c.send:
-			if !ok {
-				c.write(websocket.CloseMessage, []byte{})
-				return
+		//If there is a new connection access, pass the connection to conn through the channel
+		case conn := <-manager.register:
+			//Set the client connection to true
+			manager.clients[conn] = true
+			//Format the message of returning to the successful connection JSON
+			jsonMessage, _ := json.Marshal(&Message{Content: "/A new socket has connected. ", ServerIP: LocalIp(), SenderIP: conn.socket.RemoteAddr().String()})
+			//Call the client's send method and send messages
+			manager.send(jsonMessage, conn)
+			//If the connection is disconnected
+		case conn := <-manager.unregister:
+			//Determine the state of the connection, if it is true, turn off Send and delete the value of connecting client
+			if _, ok := manager.clients[conn]; ok {
+				close(conn.send)
+				delete(manager.clients, conn)
+				jsonMessage, _ := json.Marshal(&Message{Content: "/A socket has disconnected. ", ServerIP: LocalIp(), SenderIP: conn.socket.RemoteAddr().String()})
+				manager.send(jsonMessage, conn)
 			}
-			if err := c.write(websocket.TextMessage, message); err != nil {
-				return
-			}
-		case <-ticker.C:
-			if err := c.write(websocket.PingMessage, []byte{}); err != nil {
-				return
-			}
-		}
-	}
-}
-func (c *connection) write(mt int, payload []byte) error {
-	c.ws.SetWriteDeadline(time.Now().Add(writeWait))
-	return c.ws.WriteMessage(mt, payload)
-}
-
-func (h *hub) run() {
-	for {
-		select {
-
-		case m := <-h.broadcast:
-			connections := h.rooms[m.room]
-			for c := range connections {
+			//broadcast
+		case message := <-manager.broadcast:
+			//Traversing the client that has been connected, send the message to them
+			for conn := range manager.clients {
 				select {
-				case c.send <- m.data:
+				case conn.send <- message:
 				default:
-					close(c.send)
-					delete(connections, c)
-					if len(connections) == 0 {
-						delete(h.rooms, m.room)
-					}
+					close(conn.send)
+					delete(manager.clients, conn)
 				}
 			}
 		}
 	}
 }
 
+// Define the send method of client management
+func (manager *ClientManager) send(message []byte, ignore *Client) {
+	for conn := range manager.clients {
+		//Send messages not to the shielded connection
+		if conn != ignore {
+			conn.send <- message
+		}
+	}
+}
+
+// Define the read method of the client structure
+func (c *Client) read() {
+	defer func() {
+		manager.unregister <- c
+		_ = c.socket.Close()
+	}()
+
+	for {
+		//Read message
+		_, message, err := c.socket.ReadMessage()
+		//If there is an error message, cancel this connection and then close it
+		if err != nil {
+			manager.unregister <- c
+			_ = c.socket.Close()
+			break
+		}
+		//If there is no error message, put the information in Broadcast
+		jsonMessage, _ := json.Marshal(&Message{Sender: c.id, Content: string(message), ServerIP: LocalIp(), SenderIP: c.socket.RemoteAddr().String()})
+		manager.broadcast <- jsonMessage
+	}
+}
+
+func (c *Client) write() {
+	defer func() {
+		_ = c.socket.Close()
+	}()
+
+	for {
+		select {
+		//Read the message from send
+		case message, ok := <-c.send:
+			//If there is no message
+			if !ok {
+				_ = c.socket.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			//Write it if there is news and send it to the web side
+			_ = c.socket.WriteMessage(websocket.TextMessage, message)
+		}
+	}
+}
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024 * 1024 * 1024,
+	WriteBufferSize: 1024 * 1024 * 1024,
+	//Solving cross-domain problems
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+func wsHandler(c *gin.Context) {
+
+	//Upgrade the HTTP protocol to the websocket protocol
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		http.NotFound(c.Writer, c.Request)
+		return
+	}
+
+	//Every connection will open a new client, client.id generates through UUID to ensure that each time it is different
+	client := &Client{id: uuid.Must(uuid.NewV4(), nil).String(), socket: conn, send: make(chan []byte)}
+	//Register a new link
+	manager.register <- client
+
+	//Start the message to collect the news from the web side
+	go client.read()
+	//Start the corporation to return the message to the web side
+	go client.write()
+}
+
+func healthHandler(res http.ResponseWriter, _ *http.Request) {
+	_, _ = res.Write([]byte("ok"))
+}
+
+func LocalIp() string {
+	address, _ := net.InterfaceAddrs()
+	var ip = "localhost"
+	for _, address := range address {
+		if ipAddress, ok := address.(*net.IPNet); ok && !ipAddress.IP.IsLoopback() {
+			if ipAddress.IP.To4() != nil {
+				ip = ipAddress.IP.String()
+			}
+		}
+	}
+	return ip
+}
+
 // h
 func pong(context *gin.Context) {
+
 	context.JSON(http.StatusOK, gin.H{"hello": "world"})
 }
 func publishToRedis(log TempLog) {

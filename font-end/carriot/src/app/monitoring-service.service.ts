@@ -1,14 +1,13 @@
 import { Injectable } from '@angular/core';
-import { Observable } from 'rxjs/Observable';
-import { Subject } from 'rxjs/Subject';
-import { Observer } from 'rxjs/Observer';
+import { Observable, Subject,Observer} from 'rxjs';
+ 
 
 @Injectable({
   providedIn: 'root'
 })
 export class MonitoringServiceService {
-  private ws: WebSocket;
-  private subject: Subject<any>;
+  private ws: WebSocket ;
+  private subject: Subject<any> ;
 
   constructor() { }
 
@@ -19,7 +18,7 @@ export class MonitoringServiceService {
     return this.subject.asObservable();
   }
   create() {
-    this.ws = new WebSocket('ws://localhost:8080/echo');
+    this.ws = new WebSocket('ws://localhost:8087/monitoring');
 
     const observable = Observable.create(
       (obs: Observer<MessageEvent>) => {
@@ -42,7 +41,7 @@ export class MonitoringServiceService {
   }
 
   sendMessage(message: string) {
-    console.log(message);
+    //console.log(message);
     this.ws.send(message);
   }
 }
